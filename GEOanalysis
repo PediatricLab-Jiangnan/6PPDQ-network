@@ -1,0 +1,270 @@
+# ==================== Load Required Libraries ====================
+# Install if needed (uncomment):
+# BiocManager::install(c("GEOquery", "limma", "org.Hs.eg.db", "AnnotationDbi"))
+
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(ggplot2)
+library(tibble)
+library(org.Hs.eg.db)
+library(AnnotationDbi)  # Required for gene annotation
+library(ggrepel)
+
+# ==================== 1. Data Acquisition from GEO ====================
+setwd("Your own")
+cat("Downloading GEO dataset GSE256068...\n")
+gset <- getGEO("GSE256068", destdir = ".", getGPL = TRUE)
+
+# Extract ExpressionSet object (GEO datasets may return a list)
+eset <- if (is.list(gset)) gset else gset
+sample_info <- pData(eset)
+
+cat("Dataset summary:\n")
+cat("- Total samples:", nrow(sample_info), "\n")
+cat("- Sample metadata columns (first 5):", paste(colnames(sample_info)[1:5], collapse = ", "), "...\n")
+
+# ==================== 2. Define Experimental Groups ====================
+# Assign groups based on 'characteristics_ch1.3' field
+# Example values: "tissue: ControlHippocampus", "tissue: TLE-HS"
+sample_info$group <- case_when(
+  grepl("ControlHippocampus", sample_info$characteristics_ch1.3, ignore.case = TRUE) ~ "Control",
+  grepl("TLE-HS", sample_info$characteristics_ch1.3, ignore.case = TRUE)           ~ "Seizures",
+  TRUE                                                                             ~ "Other"
+)
+
+# Remove "Other" samples (e.g., non-target tissues)
+sample_info <- sample_info[sample_info$group != "Other", ]
+cat("\nGroup counts after filtering:\n")
+print(table(sample_info$group))
+
+# ==================== 3. Load and Annotate Expression Data ====================
+cat("\nLoading normalized TPM expression data...\n")
+expr_data <- read.table("Norm_counts_TPM.tsv", header = TRUE, row.names = 1, sep = "\t")
+cat("Raw expression matrix dimensions:", dim(expr_data), "(genes × samples)\n")
+
+# Annotate Entrez IDs to gene symbols
+gene_ids <- rownames(expr_data)
+cat("Annotating", length(gene_ids), "Entrez IDs...\n")
+
+gene_anno <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = gene_ids,
+  columns = "SYMBOL",
+  keytype = "ENTREZID"
+)
+
+# Remove duplicates (some Entrez IDs map to multiple symbols; keep first)
+gene_anno <- gene_anno[!duplicated(gene_anno$ENTREZID), ]
+
+# Merge annotation with expression data
+expr_annotated <- merge(
+  gene_anno,
+  expr_data,
+  by.x = "ENTREZID",
+  by.y = "row.names",
+  all.y = TRUE
+)
+
+rownames(expr_annotated) <- expr_annotated$ENTREZID
+expr_annotated <- expr_annotated[, -1]  # Remove ENTREZID column (now rownames)
+
+# ==================== 4. Subset Samples: Control vs Seizures ====================
+# Map GEO accession to group
+sample_mapping <- sample_info[, c("geo_accession", "group")]
+target_samples <- sample_mapping[sample_mapping$group %in% c("Control", "Seizures"), ]
+
+# Find intersection between expression data and target samples
+common_samples <- intersect(target_samples$geo_accession, colnames(expr_annotated))
+cat("Common samples found:", length(common_samples), "\n")
+
+# Subset expression matrix
+expr_subset <- expr_annotated[, c("SYMBOL", common_samples)]
+final_groups_df <- target_samples[target_samples$geo_accession %in% common_samples, ]
+group_vector <- setNames(final_groups_df$group, final_groups_df$geo_accession)
+
+cat("Final group assignment:\n")
+print(table(group_vector))
+
+# ==================== 5. Expression Matrix Preprocessing ====================
+# Separate symbols and numeric matrix
+expr_matrix <- as.matrix(expr_subset[, -1])
+gene_symbols <- expr_subset$SYMBOL
+
+# Filter lowly expressed genes: expressed (TPM > 1) in at least 3 samples
+keep <- rowSums(expr_matrix > 1) >= 3
+expr_filtered <- expr_matrix[keep, ]
+symbols_filtered <- gene_symbols[keep]
+cat("Genes retained after low-expression filter:", nrow(expr_filtered), "\n")
+
+# Log2 transformation if max value is large (typical for TPM)
+max_val <- max(expr_filtered)
+if (max_val > 50) {
+  cat("Applying log2(TPM + 1) transformation...\n")
+  expr_log <- log2(expr_filtered + 1)
+  trans_applied <- TRUE
+} else {
+  cat("Using raw expression values (no transformation).\n")
+  expr_log <- expr_filtered
+  trans_applied <- FALSE
+}
+
+# Ensure column order matches group vector
+expr_log <- expr_log[, names(group_vector)]
+stopifnot(all(colnames(expr_log) == names(group_vector)))
+
+# ==================== 6. Quality Control: Distribution & PCA ====================
+# ---- Distribution Plots ----
+set.seed(123)
+sample_idx <- sample(nrow(expr_filtered), min(1000, nrow(expr_filtered)))
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+hist(as.vector(expr_filtered[sample_idx, ]), breaks = 50, col = "lightblue", main = "Raw TPM", xlab = "TPM")
+hist(as.vector(expr_log[sample_idx, ]), breaks = 50, col = "lightcoral", main = "Log2(TPM+1)", xlab = "Log2(TPM+1)")
+
+# ---- PCA ----
+pca_input <- t(expr_log)  # Transpose: samples as rows
+pca <- prcomp(pca_input, scale. = TRUE)
+var_explained <- pca$sdev^2 / sum(pca$sdev^2) * 100
+
+pca_df <- data.frame(
+  Sample = rownames(pca_input),
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  Group = group_vector,
+  stringsAsFactors = FALSE
+)
+
+# Plot PCA with 95% confidence ellipses
+pca_plot <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, fill = Group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  stat_ellipse(level = 0.95, type = "norm", alpha = 0.2, linetype = 2) +
+  labs(
+    title = "PCA of Hippocampal Gene Expression",
+    subtitle = paste("Samples:", nrow(pca_df), "| Genes:", ncol(expr_log)),
+    x = paste0("PC1 (", round(var_explained[1], 1), "% variance)"),
+    y = paste0("PC2 (", round(var_explained[2], 1), "% variance)")
+  ) +
+  scale_color_manual(values = c("Control" = "#2E86AB", "Seizures" = "#A23B72")) +
+  scale_fill_manual(values = c("Control" = "#2E86AB", "Seizures" = "#A23B72")) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(pca_plot)
+
+# ==================== 7. Save Processed Data ====================
+# Expression matrix with gene symbols
+output_df <- data.frame(
+  ENTREZID = rownames(expr_log),
+  SYMBOL = symbols_filtered,
+  expr_log,
+  check.names = FALSE
+)
+
+write.csv(output_df, file = ifelse(trans_applied, "expression_log2_transformed.csv", "expression_raw.csv"), row.names = FALSE)
+write.csv(data.frame(Sample = names(group_vector), Group = group_vector), "sample_groups.csv", row.names = FALSE)
+ggsave("PCA_plot.pdf", pca_plot, width = 8, height = 6)
+ggsave("PCA_plot.png", pca_plot, width = 8, height = 6, dpi = 300)
+
+# ==================== 8. Differential Expression Analysis (limma) ====================
+cat("\nRunning differential expression analysis (Seizures vs Control)...\n")
+
+# Design matrix
+group_factor <- factor(group_vector, levels = c("Control", "Seizures"))
+design <- model.matrix(~ 0 + group_factor)
+colnames(design) <- c("Control", "Seizures")
+
+# Contrast: Seizures - Control
+contrast_mat <- makeContrasts(Seizures_vs_Control = Seizures - Control, levels = design)
+
+# Fit linear model
+fit <- lmFit(expr_log, design)
+fit2 <- contrasts.fit(fit, contrast_mat)
+fit2 <- eBayes(fit2)
+
+# Extract results
+deg_table <- topTable(fit2, coef = "Seizures_vs_Control", number = Inf, sort.by = "P")
+
+# Add gene symbols
+deg_table$ENTREZID <- rownames(deg_table)
+deg_table <- left_join(
+  deg_table,
+  data.frame(ENTREZID = rownames(expr_log), SYMBOL = symbols_filtered),
+  by = "ENTREZID"
+)
+
+# Remove rows without symbol
+deg_table <- deg_table[!is.na(deg_table$SYMBOL), ]
+deg_table <- deg_table[order(deg_table$P.Value), ]
+
+cat("Differential expression completed.\nTotal tested genes:", nrow(deg_table), "\n")
+
+# ==================== 9. Classify Differentially Expressed Genes ====================
+# Thresholds
+logFC_thresh <- 1      # |log2FC| ≥ 1
+padj_thresh  <- 0.05   # adjusted p-value (FDR)
+
+# Strict classification using FDR
+deg_table$Regulation_FDR <- "Not Significant"
+deg_table$Regulation_FDR[deg_table$logFC >  logFC_thresh & deg_table$adj.P.Val < padj_thresh] <- "Up"
+deg_table$Regulation_FDR[deg_table$logFC < -logFC_thresh & deg_table$adj.P.Val < padj_thresh] <- "Down"
+
+# Summary
+cat("\n=== DEG Summary (P < 0.05, |log2FC| ≥ 1) ===\n")
+print(table(deg_table$Regulation))
+
+cat("\n=== DEG Summary (FDR < 0.05, |log2FC| ≥ 1) ===\n")
+print(table(deg_table$Regulation_FDR))
+
+# Top genes
+top_up   <- head(deg_table[deg_table$Regulation == "Up", ], 10)
+top_down <- head(deg_table[deg_table$Regulation == "Down", ], 10)
+
+cat("\nTop 10 Up-regulated Genes:\n")
+print(top_up[, c("SYMBOL", "logFC", "P.Value", "adj.P.Val")])
+
+cat("\nTop 10 Down-regulated Genes:\n")
+print(top_down[, c("SYMBOL", "logFC", "P.Value", "adj.P.Val")])
+
+# Save full results
+write.csv(deg_table, "differential_expression_results.csv", row.names = FALSE)
+
+# ==================== 10. Volcano Plot ====================
+volcano_df <- deg_table
+volcano_df$neg_log10_pval <- -log10(volcano_df$P.Value)
+
+# Select top 5 up/down for labeling
+top_labels <- bind_rows(
+  head(volcano_df[volcano_df$Regulation == "Up", ], 5),
+  head(volcano_df[volcano_df$Regulation == "Down", ], 5)
+)
+
+# Volcano plot
+volcano_plot <- ggplot(volcano_df, aes(x = logFC, y = neg_log10_pval)) +
+  geom_point(aes(color = Regulation), size = 1.1, alpha = 0.7) +
+  scale_color_manual(values = c("Up" = "#E31A1C", "Down" = "#1F78B4", "Not Significant" = "gray60")) +
+  geom_hline(yintercept = -log10(pval_thresh), linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = c(-logFC_thresh, logFC_thresh), linetype = "dashed", color = "gray40") +
+  geom_text_repel(
+    data = top_labels,
+    aes(label = SYMBOL),
+    size = 3.2,
+    box.padding = 0.35,
+    point.padding = 0.3,
+    segment.color = "gray50",
+    max.overlaps = 20
+  ) +
+  labs(
+    title = "Volcano Plot: Seizures vs Control (Hippocampus)",
+    x = "Log2 Fold Change",
+    y = "-Log10(P-value)",
+    color = "Regulation"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+print(volcano_plot)
+ggsave("volcano_plot.pdf", volcano_plot, width = 9, height = 7)
+ggsave("volcano_plot.png", volcano_plot, width = 9, height = 7, dpi = 300)
+
+cat("\n✅ Analysis pipeline completed successfully!\n")
+cat("Outputs saved: expression matrix, sample groups, PCA, DEG table, volcano plot.\n")
