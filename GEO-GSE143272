@@ -1,0 +1,387 @@
+# Load necessary packages
+library(GEOquery)
+library(limma)
+library(dplyr)
+library(ggplot2)
+library(VennDiagram)
+library(tibble)
+library(org.Hs.eg.db)
+library(ggrepel)
+library(clusterProfiler)
+library(enrichplot)
+library(pathview)
+library(patchwork)
+library(pheatmap)
+
+# ==================== Data Acquisition & Preprocessing ====================
+
+# Step 1: Set working directory and download dataset
+setwd("C:\\Users\\xieru\\Desktop\\6PPQD\\GEONEW\\GSE143272")
+cat("Downloading GEO dataset...\n")
+gset <- getGEO("GSE143272", destdir = ".", getGPL = TRUE)
+
+# Step 2: Extract expression set object and sample information
+cat("Extracting dataset information...\n")
+eset <- if (is.list(gset)) gset[[1]] else gset
+sample_info <- pData(eset)
+
+cat("Dataset basic information:\n")
+cat("- Number of samples:", nrow(sample_info), "\n")
+cat("- Available column names:", paste(colnames(sample_info)[1:5], collapse = ", "), "...\n")
+
+# ==================== Sample Grouping ====================
+
+# Step 3: Check grouping information columns
+cat("\nChecking 'description' column content:\n")
+print(table(sample_info$description))
+
+cat("\nChecking 'characteristics_ch1' column content:\n")
+print(table(sample_info$characteristics_ch1))
+
+# Step 4: Create grouping variable
+sample_info$group <- ifelse(
+  grepl("Healthy Control|Control|healthy control|healthy", 
+        sample_info$description, ignore.case = TRUE), 
+  "Control", "Seizures"
+)
+
+cat("\nSample grouping statistics:\n")
+print(table(sample_info$group))
+
+# ==================== Probe ID to Gene Symbol Conversion ====================
+
+cat("=== Starting Probe Annotation Conversion ===\n")
+gpl <- fData(eset)
+
+# Confirm Symbol column exists
+if(!"Symbol" %in% colnames(gpl)) {
+  stop("Symbol column does not exist! Please check column names.")
+}
+
+# Create Probe-Symbol mapping
+probe2symbol <- data.frame(
+  ProbeID = as.character(gpl$ID),
+  Symbol = as.character(gpl$Symbol),
+  stringsAsFactors = FALSE
+)
+
+# Clean Symbol column
+probe2symbol$Symbol <- trimws(probe2symbol$Symbol)
+probe2symbol <- probe2symbol[probe2symbol$Symbol != "" & !is.na(probe2symbol$Symbol), ]
+probe2symbol <- probe2symbol[!grepl("^///$|^-$|^N/A$|^n/a$", probe2symbol$Symbol, ignore.case = TRUE), ]
+
+cat("Probe-Symbol mapping statistics:\n")
+cat("- Total probes:", nrow(probe2symbol), "\n")
+cat("- Valid Symbols:", nrow(probe2symbol), "\n")
+
+# ==================== Expression Matrix Processing ====================
+
+# Step 7: Extract expression matrix and ensure row names are characters
+expr_matrix <- exprs(eset)
+rownames(expr_matrix) <- as.character(rownames(expr_matrix))
+
+cat("\nOriginal expression matrix dimensions:", dim(expr_matrix), "\n")
+cat("Top 5 row names:", paste(head(rownames(expr_matrix), 5), collapse = ", "), "\n")
+
+# Step 8: Filter to keep only annotated probes
+common_probes <- intersect(rownames(expr_matrix), probe2symbol$ProbeID)
+cat("Number of common probes:", length(common_probes), "\n")
+
+expr_matrix <- expr_matrix[common_probes, ]
+probe2symbol <- probe2symbol[match(common_probes, probe2symbol$ProbeID), ]
+
+# Verify matching
+cat("Match verification - Are row names and ProbeID identical?:", all(rownames(expr_matrix) == probe2symbol$ProbeID), "\n")
+
+# Step 9: Set Gene Symbols as row names directly
+cat("=== Converting Probe IDs to Gene Symbols ===\n")
+
+# Create a named vector for mapping
+symbol_map <- probe2symbol$Symbol
+names(symbol_map) <- probe2symbol$ProbeID
+
+# Get new gene names
+new_symbols <- symbol_map[rownames(expr_matrix)]
+
+# Check for NAs
+na_count <- sum(is.na(new_symbols))
+cat("Number of NA gene names:", na_count, "\n")
+
+if(na_count > 0) {
+  # Remove NAs
+  valid_idx <- !is.na(new_symbols)
+  expr_matrix <- expr_matrix[valid_idx, ]
+  new_symbols <- new_symbols[valid_idx]
+}
+
+# Ensure row names are character type, not automatically converted
+rownames(expr_matrix) <- as.character(new_symbols)
+
+cat("Expression matrix dimensions after conversion:", dim(expr_matrix), "\n")
+cat("Top 10 gene names:", paste(head(rownames(expr_matrix), 10), collapse = ", "), "\n")
+cat("Gene name class:", class(rownames(expr_matrix)), "\n")
+
+# Step 10: Handle duplicated genes (keeping max standard deviation)
+cat("=== Handling Duplicated Genes ===\n")
+
+# Calculate SD for each gene
+gene_sd <- apply(expr_matrix, 1, sd)
+
+# Save original gene names
+gene_symbols <- rownames(expr_matrix)
+unique_genes <- unique(gene_symbols)
+cat("Number of unique genes:", length(unique_genes), "\n")
+
+# Method: For each gene, keep the probe with the largest SD
+expr_matrix_dedup <- matrix(0, nrow = length(unique_genes), ncol = ncol(expr_matrix))
+rownames(expr_matrix_dedup) <- unique_genes
+colnames(expr_matrix_dedup) <- colnames(expr_matrix)
+
+for(i in seq_along(unique_genes)) {
+  gene <- unique_genes[i]
+  idx <- which(gene_symbols == gene)
+  if(length(idx) == 1) {
+    expr_matrix_dedup[i, ] <- expr_matrix[idx, ]
+  } else {
+    # Keep the one with highest SD
+    sd_vals <- gene_sd[idx]
+    best_idx <- idx[which.max(sd_vals)]
+    expr_matrix_dedup[i, ] <- expr_matrix[best_idx, ]
+  }
+}
+
+expr_matrix <- expr_matrix_dedup
+
+cat("\nFinal expression matrix dimensions:", dim(expr_matrix), "\n")
+cat("- Number of genes:", nrow(expr_matrix), "\n")
+cat("- Number of samples:", ncol(expr_matrix), "\n")
+cat("- Top 10 gene names:", paste(head(rownames(expr_matrix), 10), collapse = ", "), "\n")
+
+# Verify gene name types
+cat("\nGene name type check:\n")
+cat("- Gene name class:", class(rownames(expr_matrix)), "\n")
+cat("- Are they numeric?:", sum(grepl("^[0-9]+$", rownames(expr_matrix))), "\n")
+
+# ==================== Sample Grouping Confirmation ====================
+
+group_list <- factor(sample_info$group, levels = c("Control", "Seizures"))
+cat("\nSample grouping statistics:\n")
+print(table(group_list))
+
+sample_groups <- data.frame(
+  Sample = colnames(expr_matrix),
+  Group = group_list,
+  stringsAsFactors = FALSE
+)
+
+# Save sample groups
+write.csv(sample_groups, file = "sample_groups.csv", row.names = FALSE)
+
+# Save expression matrix (with row names)
+write.csv(expr_matrix, file = "expression_matrix.csv", row.names = TRUE)
+cat("Basic data saved successfully.\n")
+
+# Verify saved files
+cat("\nVerifying saved expression matrix:\n")
+expr_check <- read.table("expression_matrix.csv", row.names = 1, header = TRUE, 
+                         sep = ",", check.names = FALSE, stringsAsFactors = FALSE)
+cat("- Dimensions after reading:", dim(expr_check), "\n")
+cat("- Top 10 gene names:", paste(head(rownames(expr_check), 10), collapse = ", "), "\n")
+
+# ==================== PCA Analysis ====================
+
+cat("\n=== Starting PCA Analysis ===\n")
+
+pca_data <- t(expr_matrix)
+pca_result <- prcomp(pca_data, scale. = TRUE)
+
+pca_var <- summary(pca_result)$importance[2, ]
+pc1_var <- round(pca_var[1] * 100, 2)
+pc2_var <- round(pca_var[2] * 100, 2)
+
+pca_df <- as.data.frame(pca_result$x[, 1:2])
+pca_df$Sample <- rownames(pca_df)
+pca_df$Group <- sample_groups$Group[match(pca_df$Sample, sample_groups$Sample)]
+
+cat("\nPCA grouping statistics:\n")
+print(table(pca_df$Group))
+
+pca_plot_ellipse <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, fill = Group)) +
+  stat_ellipse(level = 0.95, alpha = 0.3, geom = "polygon", show.legend = FALSE) +
+  geom_point(size = 4, alpha = 0.7, shape = 21, stroke = 1.5) +
+  labs(
+    title = "PCA Analysis",
+    subtitle = "Control vs Seizures",
+    x = paste0("PC1 (", pc1_var, "%)"),
+    y = paste0("PC2 (", pc2_var, "%)")
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray40"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    legend.position = "top",
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank()
+  ) +
+  scale_color_manual(
+    values = c("Control" = "#2E9FDF", "Seizures" = "#FC4E07"),
+    labels = c("Control", "Seizures")
+  ) +
+  scale_fill_manual(
+    values = c("Control" = "#2E9FDF", "Seizures" = "#FC4E07")
+  )
+
+ggsave("PCA_plot_ellipse.png", pca_plot_ellipse, width = 10, height = 8, dpi = 300)
+cat("PCA plot saved to PCA_plot_ellipse.png\n")
+
+write.csv(pca_df, file = "PCA_data.csv", row.names = FALSE)
+
+group_centers <- pca_df %>%
+  group_by(Group) %>%
+  summarise(
+    PC1_mean = mean(PC1),
+    PC2_mean = mean(PC2),
+    PC1_sd = sd(PC1),
+    PC2_sd = sd(PC2),
+    n = n()
+  )
+
+write.csv(group_centers, file = "PCA_group_centers.csv", row.names = FALSE)
+cat("PCA Analysis completed!\n")
+
+# ==================== Differential Gene Expression (DEG) Analysis ====================
+
+cat("\n=== Starting Differential Gene Analysis ===\n")
+
+design <- model.matrix(~ 0 + group_list)
+colnames(design) <- c("Control", "Seizures")
+
+fit <- lmFit(expr_matrix, design)
+contrast_matrix <- makeContrasts(Seizures - Control, levels = design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+deg_results <- topTable(fit2, coef = 1, number = Inf, adjust.method = "BH")
+deg_results$Gene <- rownames(deg_results)
+deg_results <- deg_results[, c("Gene", "logFC", "P.Value", "adj.P.Val", "t", "B")]
+
+write.csv(deg_results, file = "DEG_all_genes.csv", row.names = FALSE)
+cat("All gene differential analysis results saved to DEG_all_genes.csv\n")
+
+# Filter significant DEGs
+deg_up <- deg_results[deg_results$logFC > 0.5 & deg_results$P.Value < 0.05, ]
+deg_down <- deg_results[deg_results$logFC < -0.5 & deg_results$P.Value < 0.05, ]
+deg_all <- deg_results[deg_results$P.Value < 0.05, ]
+
+cat("\nDifferential Gene Statistics:\n")
+cat("- Upregulated genes:", nrow(deg_up), "\n")
+cat("- Downregulated genes:", nrow(deg_down), "\n")
+cat("- Total significant DEGs:", nrow(deg_all), "\n")
+
+write.csv(deg_up, file = "DEG_upregulated.csv", row.names = FALSE)
+write.csv(deg_down, file = "DEG_downregulated.csv", row.names = FALSE)
+write.csv(deg_all, file = "DEG_significant.csv", row.names = FALSE)
+cat("Differential gene files saved.\n")
+
+
+# ==================== Volcano Plot ====================
+
+
+cat("\n=== Generating Volcano Plot ===\n")
+
+# Add significance labels for plotting
+deg_results$Significance <- "Not Significant"
+deg_results$Significance[deg_results$logFC > 0.5 & deg_results$P.Value < 0.05] <- "Up"
+deg_results$Significance[deg_results$logFC < -0.5 & deg_results$P.Value < 0.05] <- "Down"
+
+volcano_plot <- ggplot(deg_results, aes(x = logFC, y = -log10(P.Value), color = Significance)) +
+  geom_point(alpha = 0.8, size = 1.5) +
+  scale_color_manual(values = c("Down" = "#2E9FDF", "Not Significant" = "grey", "Up" = "#FC4E07")) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  labs(title = "Volcano Plot (Seizures vs Control)", x = "log2(Fold Change)", y = "-log10(P-value)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave("Volcano_Plot.png", volcano_plot, width = 8, height = 6, dpi = 300)
+cat("Volcano plot saved to Volcano_Plot.png\n")
+
+
+# ==================== Heatmap of Top DEGs ====================
+
+
+[Image of gene expression heatmap]
+
+
+cat("\n=== Generating Heatmap ===\n")
+
+# Select top 50 significant genes based on p-value
+top_genes <- head(deg_results[order(deg_results$P.Value), "Gene"], 50)
+heatmap_data <- expr_matrix[top_genes, ]
+
+# Setup annotation column for heatmap
+annotation_col <- data.frame(Group = sample_groups$Group)
+rownames(annotation_col) <- sample_groups$Sample
+
+# Generate and save heatmap
+png("Heatmap_Top50_DEGs.png", width = 8, height = 10, units = "in", res = 300)
+pheatmap(heatmap_data, 
+         scale = "row",
+         annotation_col = annotation_col,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         show_colnames = FALSE,
+         fontsize_row = 6,
+         main = "Heatmap of Top 50 DEGs")
+dev.off()
+cat("Heatmap saved to Heatmap_Top50_DEGs.png\n")
+
+
+# ==================== GO & KEGG Enrichment Analysis ====================
+
+
+cat("\n=== Starting GO and KEGG Enrichment Analysis ===\n")
+
+# Ensure there are significant genes before proceeding
+if(nrow(deg_all) > 0) {
+  
+  # Convert Gene Symbols to Entrez IDs (Required for KEGG)
+  gene_ids <- bitr(deg_all$Gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  
+  cat("Running GO Enrichment...\n")
+  go_results <- enrichGO(gene = deg_all$Gene,
+                         OrgDb = org.Hs.eg.db,
+                         keyType = "SYMBOL",
+                         ont = "ALL",          # BP, CC, and MF
+                         pvalueCutoff = 0.05,
+                         qvalueCutoff = 0.2)
+  
+  if(!is.null(go_results)) {
+    write.csv(as.data.frame(go_results), "GO_Enrichment_Results.csv", row.names = FALSE)
+    go_plot <- dotplot(go_results, split = "ONTOLOGY", showCategory = 5) + facet_grid(ONTOLOGY~., scale="free")
+    ggsave("GO_Enrichment_Dotplot.png", go_plot, width = 10, height = 8, dpi = 300)
+    cat("GO enrichment results and plot saved.\n")
+  }
+  
+  cat("Running KEGG Enrichment...\n")
+  kegg_results <- enrichKEGG(gene = gene_ids$ENTREZID,
+                             organism = 'hsa',
+                             pvalueCutoff = 0.05)
+  
+  if(!is.null(kegg_results)) {
+    # Convert KEGG Entrez IDs back to Gene Symbols for readability
+    kegg_results <- setReadable(kegg_results, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    write.csv(as.data.frame(kegg_results), "KEGG_Enrichment_Results.csv", row.names = FALSE)
+    kegg_plot <- dotplot(kegg_results, showCategory = 10, title = "KEGG Pathway Enrichment")
+    ggsave("KEGG_Enrichment_Dotplot.png", kegg_plot, width = 8, height = 6, dpi = 300)
+    cat("KEGG enrichment results and plot saved.\n")
+  }
+  
+} else {
+  cat("No significant genes found. Skipping enrichment analysis.\n")
+}
+
+cat("\n=== Full Analysis Pipeline Completed Successfully! ===\n")
